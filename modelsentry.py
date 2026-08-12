@@ -231,6 +231,14 @@ def main():
     url_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
     url_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
     
+    # scan-urls batch command
+    urls_parser = subparsers.add_parser("scan-urls", help="Scan multiple URLs from a text file (one URL per line)")
+    urls_parser.add_argument("file", help="Path to text file containing list of URLs")
+    urls_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    urls_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
+    urls_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    urls_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
+    
     args = parser.parse_args()
     
     results = []
@@ -251,6 +259,15 @@ def main():
     elif args.command == "scan-url":
         res = handle_url_scan(args.url, is_json=args.json)
         results.append(res)
+        
+    elif args.command == "scan-urls":
+        if not os.path.exists(args.file):
+            console.print(f"[bold red]Error:[/bold red] URL list file '{args.file}' not found.")
+            sys.exit(1)
+        with open(args.file, 'r', encoding='utf-8') as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        for u in urls:
+            results.append(handle_url_scan(u, is_json=args.json))
         
     # Output presentation
     if args.json:
