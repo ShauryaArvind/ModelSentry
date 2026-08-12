@@ -350,7 +350,7 @@ def validate_safetensors(filepath):
     except Exception as e:
         return "MALICIOUS", f"Failed to parse safetensors file: {str(e)}", {}
 
-def scan_file(filepath, custom_blocklist=None, custom_allowlist=None):
+def scan_file(filepath, custom_blocklist=None, custom_allowlist=None, max_size_mb=None):
     """
     Routes the file to the correct scanner layer and returns a verdict dictionary.
     """
@@ -364,6 +364,18 @@ def scan_file(filepath, custom_blocklist=None, custom_allowlist=None):
             "reasons": ["File not found"],
             "details": {}
         }
+        
+    if max_size_mb is not None and os.path.exists(filepath):
+        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        if file_size_mb > max_size_mb:
+            return {
+                "filepath": filepath,
+                "sha256": sha256_hash,
+                "file_type": "large_file",
+                "verdict": "SUSPICIOUS",
+                "reasons": [f"File size ({file_size_mb:.2f} MB) exceeds maximum allowed threshold of {max_size_mb} MB"],
+                "details": {}
+            }
         
     try:
         with open(filepath, 'rb') as f:

@@ -71,10 +71,27 @@ Integrate ModelSentry into automated security workflows by outputting machine-re
 python modelsentry.py scan SAMPLES/ --recursive --json
 ```
 
-### Scanning a Remote URL
-You can perform a pre-download safety scan directly from a Hugging Face hub or public URL:
+### Exporting Security Audit Reports (HTML & Markdown)
+Generate standalone security audit reports for compliance and security reviews:
 ```bash
+python modelsentry.py scan SAMPLES/ --recursive --export-report report.html
+python modelsentry.py scan SAMPLES/ --recursive --export-report report.md
+```
+
+### Custom Blocklist & Allowlist Rules
+Supply custom rules via text or JSON files:
+```bash
+python modelsentry.py scan SAMPLES/ --blocklist custom_blocklist.txt --allowlist custom_allowlist.txt
+```
+
+### Scanning Remote URLs & Batch URL Lists
+Perform pre-download safety checks for single remote models or batch lists of model URLs:
+```bash
+# Single URL
 python modelsentry.py scan-url https://example.com/path/to/model.pt
+
+# Batch list of URLs from a text file (one URL per line)
+python modelsentry.py scan-urls url_list.txt --export-report batch_audit.html
 ```
 
 ---

@@ -194,3 +194,35 @@ def test_safetensors_truncated(temp_dir):
     result = scan_file(str(file_path))
     assert result["verdict"] == "MALICIOUS"
     assert any("truncated by 4 bytes" in r for r in result["reasons"])
+
+def test_sha256_generation(temp_dir):
+    file_path = temp_dir / "sample.pkl"
+    with open(file_path, "wb") as f:
+        pickle.dump({"a": 1}, f)
+    result = scan_file(str(file_path))
+    assert "sha256" in result
+    assert len(result["sha256"]) == 64
+
+def test_custom_rules(temp_dir):
+    file_path = temp_dir / "custom.pkl"
+    # Create raw pickle calling custom_mod.func
+    pickle_bytes = b"ccustom_mod\nfunc\n(I1\ntR."
+    with open(file_path, "wb") as f:
+        f.write(pickle_bytes)
+        
+    # With custom blocklist containing custom_mod.func -> MALICIOUS
+    res_blocked = scan_file(str(file_path), custom_blocklist={"custom_mod.func"})
+    assert res_blocked["verdict"] == "MALICIOUS"
+    
+    # With custom allowlist containing custom_mod -> SAFE
+    res_allowed = scan_file(str(file_path), custom_allowlist={"custom_mod"})
+    assert res_allowed["verdict"] == "SAFE"
+
+def test_max_size_threshold(temp_dir):
+    file_path = temp_dir / "large.pkl"
+    with open(file_path, "wb") as f:
+        f.write(b"0" * (1024 * 1024)) # 1MB file
+    result = scan_file(str(file_path), max_size_mb=0.5)
+    assert result["verdict"] == "SUSPICIOUS"
+    assert any("exceeds maximum allowed threshold" in r for r in result["reasons"])
+
