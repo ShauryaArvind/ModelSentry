@@ -139,15 +139,23 @@ def main():
     scan_parser.add_argument("path", help="Path to local file or directory to scan")
     scan_parser.add_argument("-r", "--recursive", action="store_true", help="Scan subdirectories recursively")
     scan_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    scan_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
+    scan_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
     
     # scan-url command
     url_parser = subparsers.add_parser("scan-url", help="Download and scan a model from a remote URL")
     url_parser.add_argument("url", help="URL of the model file")
     url_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    url_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
+    url_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
     
     args = parser.parse_args()
     
     results = []
+    
+    from scanner import load_custom_rules_file
+    custom_blocklist = load_custom_rules_file(getattr(args, "blocklist", None))
+    custom_allowlist = load_custom_rules_file(getattr(args, "allowlist", None))
     
     if args.command == "scan":
         files = get_all_files(args.path, recursive=args.recursive)
@@ -156,10 +164,12 @@ def main():
             sys.exit(1)
             
         for filepath in files:
-            results.append(scan_file(filepath))
+            results.append(scan_file(filepath, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist))
             
     elif args.command == "scan-url":
-        results.append(handle_url_scan(args.url, is_json=args.json))
+        res = handle_url_scan(args.url, is_json=args.json)
+        # re-evaluate rules with custom list if provided
+        results.append(res)
         
     # Output presentation
     if args.json:

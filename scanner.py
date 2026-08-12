@@ -31,10 +31,38 @@ BLOCKLIST = {
     'eval', 'exec', 'compile', '__import__', 'getattr', 'setattr'
 }
 
-def is_allowlisted(ref: str) -> bool:
+def load_custom_rules_file(filepath):
+    """
+    Loads custom rules (blocklist or allowlist entries) from a text or JSON file.
+    """
+    entries = set()
+    if not filepath or not os.path.exists(filepath):
+        return entries
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if content.startswith('{') or content.startswith('['):
+                data = json.loads(content)
+                if isinstance(data, list):
+                    entries.update(data)
+                elif isinstance(data, dict):
+                    entries.update(data.get("rules", []))
+            else:
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        entries.add(line)
+    except Exception:
+        pass
+    return entries
+
+def is_allowlisted(ref: str, custom_allowlist=None) -> bool:
     """
     Check if a reference is known to be clean and standard for machine learning files.
     """
+    if custom_allowlist and (ref in custom_allowlist or ref.split('.')[0] in custom_allowlist):
+        return True
+
     parts = ref.split('.')
     base_module = parts[0]
     
@@ -57,7 +85,7 @@ def is_allowlisted(ref: str) -> bool:
         
     return False
 
-def check_rules(calls):
+def check_rules(calls, custom_blocklist=None, custom_allowlist=None):
     """
     Matches extracted references against the blocklist and allowlist.
     Returns: (verdict, reasons)
@@ -65,19 +93,23 @@ def check_rules(calls):
     verdict = "SAFE"
     reasons = []
     
+    active_blocklist = set(BLOCKLIST)
+    if custom_blocklist:
+        active_blocklist.update(custom_blocklist)
+        
     malicious_calls = []
     suspicious_calls = []
     
     for call in calls:
         is_blocked = False
-        for blocked in BLOCKLIST:
+        for blocked in active_blocklist:
             if call == blocked or call.startswith(blocked + '.'):
                 is_blocked = True
                 break
                 
         if is_blocked:
             malicious_calls.append(call)
-        elif not is_allowlisted(call):
+        elif not is_allowlisted(call, custom_allowlist=custom_allowlist):
             suspicious_calls.append(call)
             
     if malicious_calls:
@@ -318,7 +350,7 @@ def validate_safetensors(filepath):
     except Exception as e:
         return "MALICIOUS", f"Failed to parse safetensors file: {str(e)}", {}
 
-def scan_file(filepath):
+def scan_file(filepath, custom_blocklist=None, custom_allowlist=None):
     """
     Routes the file to the correct scanner layer and returns a verdict dictionary.
     """
@@ -417,7 +449,7 @@ def scan_file(filepath):
                     "reasons": ["Zip archive contains no pickle files"],
                     "details": {}
                 }
-        verdict, reasons = check_rules(calls)
+        verdict, reasons = check_rules(calls, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist)
         return {
             "filepath": filepath,
             "sha256": sha256_hash,
@@ -443,7 +475,15 @@ def scan_file(filepath):
                     "details": {}
                 }
                 
-            verdict, reasons = check_rules(calls)
+            verdict, reasons = check_rules(calls, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist)
+            return {
+                "filepath": filepath,
+                "sha256": sha256_hash,
+                "file_type": "pickle",
+                "verdict": verdict,
+                "reasons": reasons if reasons else ["No suspicious or blocked calls detected"],
+                "details": {"extracted_calls": calls}
+            }
             return {
                 "filepath": filepath,
                 "sha256": sha256_hash,
