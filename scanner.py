@@ -3,6 +3,18 @@ import json
 import struct
 import zipfile
 import pickletools
+import hashlib
+
+def calculate_sha256(filepath):
+    """Calculates the SHA-256 hex digest of a file."""
+    hasher = hashlib.sha256()
+    try:
+        with open(filepath, 'rb') as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return "N/A"
 
 # Rule-based detection settings
 BLOCKLIST = {
@@ -310,9 +322,11 @@ def scan_file(filepath):
     """
     Routes the file to the correct scanner layer and returns a verdict dictionary.
     """
+    sha256_hash = calculate_sha256(filepath)
     if not os.path.exists(filepath):
         return {
             "filepath": filepath,
+            "sha256": "N/A",
             "file_type": "none",
             "verdict": "SUSPICIOUS",
             "reasons": ["File not found"],
@@ -325,6 +339,7 @@ def scan_file(filepath):
     except Exception as e:
         return {
             "filepath": filepath,
+            "sha256": sha256_hash,
             "file_type": "none",
             "verdict": "SUSPICIOUS",
             "reasons": [f"Cannot read file: {str(e)}"],
@@ -348,6 +363,7 @@ def scan_file(filepath):
         if lambdas:
             return {
                 "filepath": filepath,
+                "sha256": sha256_hash,
                 "file_type": "hdf5",
                 "verdict": "MALICIOUS",
                 "reasons": [f"Contains {len(lambdas)} Keras Lambda layer(s) which can execute arbitrary Python code on load"],
@@ -356,6 +372,7 @@ def scan_file(filepath):
         else:
             return {
                 "filepath": filepath,
+                "sha256": sha256_hash,
                 "file_type": "hdf5",
                 "verdict": "SAFE",
                 "reasons": ["No Keras Lambda layers detected"],
@@ -366,6 +383,7 @@ def scan_file(filepath):
         verdict, reason, header = validate_safetensors(filepath)
         return {
             "filepath": filepath,
+            "sha256": sha256_hash,
             "file_type": "safetensors",
             "verdict": verdict,
             "reasons": [reason],
@@ -384,6 +402,7 @@ def scan_file(filepath):
             if has_pickles:
                 return {
                     "filepath": filepath,
+                    "sha256": sha256_hash,
                     "file_type": "pytorch_zip",
                     "verdict": "SUSPICIOUS",
                     "reasons": ["Failed to extract or parse any pickle calls from the PyTorch zip archive"],
@@ -392,6 +411,7 @@ def scan_file(filepath):
             else:
                 return {
                     "filepath": filepath,
+                    "sha256": sha256_hash,
                     "file_type": "pytorch_zip",
                     "verdict": "SAFE",
                     "reasons": ["Zip archive contains no pickle files"],
@@ -400,6 +420,7 @@ def scan_file(filepath):
         verdict, reasons = check_rules(calls)
         return {
             "filepath": filepath,
+            "sha256": sha256_hash,
             "file_type": "pytorch_zip",
             "verdict": verdict,
             "reasons": reasons if reasons else ["No suspicious or blocked calls detected"],
@@ -415,6 +436,7 @@ def scan_file(filepath):
             if not calls and file_type == "unknown":
                 return {
                     "filepath": filepath,
+                    "sha256": sha256_hash,
                     "file_type": "unknown",
                     "verdict": "SUSPICIOUS",
                     "reasons": ["Unsupported or unrecognized file format"],
@@ -424,6 +446,7 @@ def scan_file(filepath):
             verdict, reasons = check_rules(calls)
             return {
                 "filepath": filepath,
+                "sha256": sha256_hash,
                 "file_type": "pickle",
                 "verdict": verdict,
                 "reasons": reasons if reasons else ["No suspicious or blocked calls detected"],
@@ -432,6 +455,7 @@ def scan_file(filepath):
         except Exception as e:
             return {
                 "filepath": filepath,
+                "sha256": sha256_hash,
                 "file_type": "unknown",
                 "verdict": "SUSPICIOUS",
                 "reasons": [f"Unrecognized file format or failed to read/parse: {str(e)}"],

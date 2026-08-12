@@ -87,6 +87,7 @@ def print_rich_report(results):
     table = Table(title="ModelSentry Scan Results", expand=True)
     table.add_column("File Path", style="cyan", no_wrap=False)
     table.add_column("Type", style="magenta", width=12)
+    table.add_column("SHA-256", style="dim green", width=14)
     table.add_column("Verdict", width=12)
     table.add_column("Details/Reasons", style="white")
     
@@ -99,8 +100,9 @@ def print_rich_report(results):
         else:
             verdict_str = "[bold green]SAFE[/bold green]"
             
+        sha_short = r.get("sha256", "N/A")[:12] if r.get("sha256") != "N/A" else "N/A"
         reasons_str = "\n".join(f"- {reason}" for reason in r["reasons"])
-        table.add_row(r["filepath"], r["file_type"], verdict_str, reasons_str)
+        table.add_row(r["filepath"], r["file_type"], sha_short, verdict_str, reasons_str)
         
     console.print(table)
     console.print("\n")
