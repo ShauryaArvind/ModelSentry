@@ -128,6 +128,86 @@ def print_rich_report(results):
         
     console.print(Panel(summary_text, title=title, border_style=panel_color))
 
+def export_report(results, output_path):
+    """
+    Exports scan results as a Markdown or HTML audit report.
+    """
+    total = len(results)
+    malicious = sum(1 for r in results if r["verdict"] == "MALICIOUS")
+    suspicious = sum(1 for r in results if r["verdict"] == "SUSPICIOUS")
+    safe = sum(1 for r in results if r["verdict"] == "SAFE")
+    
+    if output_path.endswith('.html') or output_path.endswith('.htm'):
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>ModelSentry Audit Report</title>
+    <style>
+        body {{ font-family: system-ui, sans-serif; margin: 40px; background: #0f172a; color: #f8fafc; }}
+        h1 {{ color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 10px; }}
+        .summary {{ background: #1e293b; padding: 20px; border-radius: 8px; margin-bottom: 30px; border: 1px solid #334155; }}
+        table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; }}
+        th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; }}
+        th {{ background: #334155; color: #f1f5f9; }}
+        .SAFE {{ color: #4ade80; font-weight: bold; }}
+        .SUSPICIOUS {{ color: #facc15; font-weight: bold; }}
+        .MALICIOUS {{ color: #f87171; font-weight: bold; }}
+        code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; font-family: monospace; }}
+    </style>
+</head>
+<body>
+    <h1>ModelSentry Security Audit Report</h1>
+    <div class="summary">
+        <h3>Scan Overview</h3>
+        <p>Total Scanned: <strong>{total}</strong> | Safe: <span class="SAFE">{safe}</span> | Suspicious: <span class="SUSPICIOUS">{suspicious}</span> | Malicious: <span class="MALICIOUS">{malicious}</span></p>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>File Path</th>
+                <th>Type</th>
+                <th>SHA-256</th>
+                <th>Verdict</th>
+                <th>Reasons / Findings</th>
+            </tr>
+        </thead>
+        <tbody>
+"""
+        for r in results:
+            sha = r.get('sha256', 'N/A')
+            reasons = "<br>".join(r['reasons'])
+            html_content += f"""            <tr>
+                <td><code>{r['filepath']}</code></td>
+                <td>{r['file_type']}</td>
+                <td><code>{sha[:16]}...</code></td>
+                <td class="{r['verdict']}">{r['verdict']}</td>
+                <td>{reasons}</td>
+            </tr>\n"""
+        html_content += """        </tbody>
+    </table>
+</body>
+</html>"""
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+    else:
+        md_content = f"# ModelSentry Security Audit Report\n\n"
+        md_content += f"## Scan Summary\n"
+        md_content += f"- **Total Scanned**: {total}\n"
+        md_content += f"- **SAFE**: {safe}\n"
+        md_content += f"- **SUSPICIOUS**: {suspicious}\n"
+        md_content += f"- **MALICIOUS**: {malicious}\n\n"
+        md_content += f"## Detailed Findings\n\n"
+        md_content += f"| File Path | Format | SHA-256 Digest | Verdict | Reasons / Findings |\n"
+        md_content += f"|---|---|---|---|---|\n"
+        for r in results:
+            sha = r.get('sha256', 'N/A')
+            reasons = "<br>".join(r['reasons'])
+            md_content += f"| `{r['filepath']}` | {r['file_type']} | `{sha[:12]}...` | **{r['verdict']}** | {reasons} |\n"
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+            
+    console.print(f"[bold green]Security report successfully exported to:[/bold green] {output_path}")
+
 def main():
     parser = argparse.ArgumentParser(
         description="ModelSentry - Static Malware Scanner for AI Model Files (.pkl, .pt, .h5, .safetensors)"
@@ -141,6 +221,7 @@ def main():
     scan_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
     scan_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     scan_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    scan_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
     
     # scan-url command
     url_parser = subparsers.add_parser("scan-url", help="Download and scan a model from a remote URL")
@@ -148,6 +229,7 @@ def main():
     url_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
     url_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     url_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    url_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
     
     args = parser.parse_args()
     
@@ -168,7 +250,6 @@ def main():
             
     elif args.command == "scan-url":
         res = handle_url_scan(args.url, is_json=args.json)
-        # re-evaluate rules with custom list if provided
         results.append(res)
         
     # Output presentation
@@ -176,6 +257,9 @@ def main():
         print(json.dumps(results, indent=2))
     else:
         print_rich_report(results)
+        
+    if getattr(args, "export_report", None):
+        export_report(results, args.export_report)
         
     # Set exit code: 1 if any malicious files detected
     any_malicious = any(r["verdict"] == "MALICIOUS" for r in results)
