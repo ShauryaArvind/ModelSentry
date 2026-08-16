@@ -17,7 +17,6 @@ def main():
     print("Generating SAMPLES/malicious_pickle.pkl...")
     class MaliciousReduce:
         def __reduce__(self):
-            # Safe representation of code execution risk using print
             return (print, ("⚠️ Alert: This model is calling an executable function!",))
             
     with open("SAMPLES/malicious_pickle.pkl", "wb") as f:
@@ -72,16 +71,15 @@ def main():
     }
     st_header_bytes = json.dumps(st_header).encode('utf-8')
     st_header_size = len(st_header_bytes)
-    st_data = b'\x00\x00\x80?\x00\x00\x00@' # float32: [1.0, 2.0]
+    st_data = b'\x00\x00\x80?\x00\x00\x00@'
     
     with open("SAMPLES/benign_safetensors.safetensors", "wb") as f:
         f.write(struct.pack('<Q', st_header_size))
         f.write(st_header_bytes)
         f.write(st_data)
         
-    # 6. Malicious Safetensors (appended extra payload bytes at the end)
+    # 6. Malicious Safetensors (appended payload bytes)
     print("Generating SAMPLES/malicious_safetensors.safetensors...")
-    # Header claims data ends at byte 8, but we write 2048 bytes of extra payload after that.
     payload = b'MALICIOUS_EXECUTABLE_OR_SHELLCODE_HERE' + b'\x00' * 2000
     with open("SAMPLES/malicious_safetensors.safetensors", "wb") as f:
         f.write(struct.pack('<Q', st_header_size))
@@ -89,7 +87,35 @@ def main():
         f.write(st_data)
         f.write(payload)
         
-    print("All samples generated successfully under SAMPLES/ directory.")
+    # 7. Benign GGUF
+    print("Generating SAMPLES/benign_gguf.gguf...")
+    with open("SAMPLES/benign_gguf.gguf", "wb") as f:
+        f.write(b'GGUF') # Magic
+        f.write(struct.pack('<IQQ', 3, 12, 4)) # Version 3, 12 tensors, 4 kv pairs
+        f.write(b'\x00' * 128)
+        
+    # 8. Benign ONNX
+    print("Generating SAMPLES/benign_onnx.onnx...")
+    with open("SAMPLES/benign_onnx.onnx", "wb") as f:
+        f.write(b'\x08\x03\x12\x07onnx.ai\x1a\x10graph_definition')
+        
+    # 9. Malicious ONNX (path traversal attempt)
+    print("Generating SAMPLES/malicious_onnx.onnx...")
+    with open("SAMPLES/malicious_onnx.onnx", "wb") as f:
+        f.write(b'\x08\x03\x12\x07onnx.ai\x1a\x10external_data: ../../../etc/passwd')
+        
+    # 10. Benign NumPy (.npy)
+    print("Generating SAMPLES/benign_numpy.npy...")
+    header_dict = "{'descr': '<f8', 'fortran_order': False, 'shape': (2, 2)}"
+    header_bytes = header_dict.encode('latin1')
+    header_len = len(header_bytes)
+    with open("SAMPLES/benign_numpy.npy", "wb") as f:
+        f.write(b'\x93NUMPY\x01\x00')
+        f.write(struct.pack('<H', header_len))
+        f.write(header_bytes)
+        f.write(b'\x00' * 32)
+        
+    print("All sample files successfully generated in SAMPLES/ directory.")
 
 if __name__ == "__main__":
     main()

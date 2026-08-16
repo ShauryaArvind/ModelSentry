@@ -4,14 +4,45 @@ import json
 import argparse
 import urllib.request
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from scanner import scan_file
+from scanner import scan_file, load_custom_rules_file
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 console = Console()
+
+def load_config_file(config_path=None):
+    """
+    Loads configuration settings from .modelsentryrc or modelsentry.json.
+    """
+    config = {
+        "blocklist": None,
+        "allowlist": None,
+        "threads": 4,
+        "max_size_mb": None,
+        "min_severity": "SAFE"
+    }
+    paths_to_check = [config_path] if config_path else [".modelsentryrc", "modelsentry.json"]
+    for path in paths_to_check:
+        if path and os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    config.update(data)
+                    break
+            except Exception:
+                pass
+    return config
 
 def get_all_files(path, recursive=False):
     """
@@ -23,7 +54,6 @@ def get_all_files(path, recursive=False):
         files.append(path)
     elif os.path.isdir(path):
         for root, dirs, filenames in os.walk(path):
-            # Skip common non-project directories
             dirs[:] = [d for d in dirs if d not in ('.git', '.venv', 'venv', '__pycache__', '.pytest_cache', '.agents', '.antigravity-ide')]
             for filename in filenames:
                 files.append(os.path.join(root, filename))
@@ -31,7 +61,7 @@ def get_all_files(path, recursive=False):
                 break
     return files
 
-def handle_url_scan(url, is_json=False):
+def handle_url_scan(url, is_json=False, custom_blocklist=None, custom_allowlist=None):
     """
     Downloads a file to a temporary location and scans it.
     """
@@ -39,12 +69,10 @@ def handle_url_scan(url, is_json=False):
         console.print(f"[bold blue]Downloading file from URL:[/bold blue] {url}")
         
     try:
-        # Create a temp file with the same extension if possible
         ext = os.path.splitext(url.split('?')[0])[1]
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as temp_file:
             temp_path = temp_file.name
             
-        # Download with a progress spinner
         if not is_json:
             with Progress(
                 SpinnerColumn(),
@@ -56,11 +84,9 @@ def handle_url_scan(url, is_json=False):
         else:
             urllib.request.urlretrieve(url, temp_path)
             
-        result = scan_file(temp_path)
-        # Fix the filename in results to the original URL
+        result = scan_file(temp_path, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist)
         result["filepath"] = url
         
-        # Clean up temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
             
@@ -68,46 +94,52 @@ def handle_url_scan(url, is_json=False):
     except Exception as e:
         return {
             "filepath": url,
+            "sha256": "N/A",
             "file_type": "none",
             "verdict": "SUSPICIOUS",
+            "risk_score": 5.0,
+            "severity": "MEDIUM",
             "reasons": [f"Failed to download/scan URL: {str(e)}"],
             "details": {}
         }
 
 def print_rich_report(results):
     """
-    Prints a beautiful, colored CLI report.
+    Prints a beautiful, colored CLI report with Risk Scores and Severity levels.
     """
     total = len(results)
     malicious_count = sum(1 for r in results if r["verdict"] == "MALICIOUS")
     suspicious_count = sum(1 for r in results if r["verdict"] == "SUSPICIOUS")
     safe_count = sum(1 for r in results if r["verdict"] == "SAFE")
     
-    # Table of details
-    table = Table(title="ModelSentry Scan Results", expand=True)
+    table = Table(title="🛡️ ModelSentry Scan Results", expand=True)
     table.add_column("File Path", style="cyan", no_wrap=False)
     table.add_column("Type", style="magenta", width=12)
-    table.add_column("SHA-256", style="dim green", width=14)
+    table.add_column("Risk / Severity", width=16)
     table.add_column("Verdict", width=12)
-    table.add_column("Details/Reasons", style="white")
+    table.add_column("Details & Security Findings", style="white")
     
     for r in results:
         verdict = r["verdict"]
+        risk_score = r.get("risk_score", 0.0)
+        severity = r.get("severity", "SAFE")
+        
         if verdict == "MALICIOUS":
             verdict_str = "[bold red]MALICIOUS[/bold red]"
+            sev_str = f"[bold red]{severity} ({risk_score}/10)[/bold red]"
         elif verdict == "SUSPICIOUS":
             verdict_str = "[bold yellow]SUSPICIOUS[/bold yellow]"
+            sev_str = f"[bold yellow]{severity} ({risk_score}/10)[/bold yellow]"
         else:
             verdict_str = "[bold green]SAFE[/bold green]"
+            sev_str = f"[bold green]{severity} ({risk_score}/10)[/bold green]"
             
-        sha_short = r.get("sha256", "N/A")[:12] if r.get("sha256") != "N/A" else "N/A"
         reasons_str = "\n".join(f"- {reason}" for reason in r["reasons"])
-        table.add_row(r["filepath"], r["file_type"], sha_short, verdict_str, reasons_str)
+        table.add_row(r["filepath"], r["file_type"], sev_str, verdict_str, reasons_str)
         
     console.print(table)
     console.print("\n")
     
-    # Summary card
     summary_text = (
         f"[bold]Scan Summary:[/bold]\n"
         f"- Total Files Scanned: {total}\n"
@@ -121,16 +153,70 @@ def print_rich_report(results):
         title = "[CRITICAL] SECURITY ALERT - MALICIOUS MODELS DETECTED"
     elif suspicious_count > 0:
         panel_color = "yellow"
-        title = "[WARNING] SUSPICIOUS METADATA DETECTED"
+        title = "[WARNING] SUSPICIOUS METADATA / PAYLOADS DETECTED"
     else:
         panel_color = "green"
         title = "[OK] SCAN PASSED - ALL MODELS SAFE"
         
     console.print(Panel(summary_text, title=title, border_style=panel_color))
 
+def export_sarif_report(results, output_path):
+    """
+    Exports scan results as OASIS SARIF v2.1.0 JSON format for GitHub Security integration.
+    """
+    sarif = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "ModelSentry",
+                        "informationUri": "https://github.com/ShauryaArvind/ModelSentry",
+                        "semanticVersion": "2.0.0",
+                        "rules": [
+                            {
+                                "id": "MS001",
+                                "name": "ArbitraryCodeExecution",
+                                "shortDescription": {"text": "Arbitrary python code execution vector detected in model artifact"}
+                            },
+                            {
+                                "id": "MS002",
+                                "name": "SuspiciousPayloadOrAppendedData",
+                                "shortDescription": {"text": "Suspicious payload or appended bytes outside model metadata boundaries"}
+                            }
+                        ]
+                    }
+                },
+                "results": []
+            }
+        ]
+    }
+    
+    for r in results:
+        if r["verdict"] in ("MALICIOUS", "SUSPICIOUS"):
+            rule_id = "MS001" if r["verdict"] == "MALICIOUS" else "MS002"
+            level = "error" if r["verdict"] == "MALICIOUS" else "warning"
+            sarif["runs"][0]["results"].append({
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": f"ModelSentry finding for {r['filepath']}: " + "; ".join(r["reasons"])},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": r["filepath"]}
+                        }
+                    }
+                ]
+            })
+            
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(sarif, f, indent=2)
+    console.print(f"[bold green]SARIF v2.1.0 security report exported to:[/bold green] {output_path}")
+
 def export_report(results, output_path):
     """
-    Exports scan results as a Markdown or HTML audit report.
+    Exports scan results as a Markdown or interactive dark-mode HTML audit report.
     """
     total = len(results)
     malicious = sum(1 for r in results if r["verdict"] == "MALICIOUS")
@@ -139,48 +225,61 @@ def export_report(results, output_path):
     
     if output_path.endswith('.html') or output_path.endswith('.htm'):
         html_content = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>ModelSentry Audit Report</title>
+    <meta charset="UTF-8">
+    <title>ModelSentry Security Audit Dashboard</title>
     <style>
-        body {{ font-family: system-ui, sans-serif; margin: 40px; background: #0f172a; color: #f8fafc; }}
-        h1 {{ color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 10px; }}
-        .summary {{ background: #1e293b; padding: 20px; border-radius: 8px; margin-bottom: 30px; border: 1px solid #334155; }}
-        table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; }}
-        th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; }}
-        th {{ background: #334155; color: #f1f5f9; }}
-        .SAFE {{ color: #4ade80; font-weight: bold; }}
-        .SUSPICIOUS {{ color: #facc15; font-weight: bold; }}
-        .MALICIOUS {{ color: #f87171; font-weight: bold; }}
-        code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; font-family: monospace; }}
+        :root {{ --bg: #0b0f19; --card: #151c2c; --border: #232d42; --text: #f1f5f9; --sub: #94a3b8; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 40px; background: var(--bg); color: var(--text); }}
+        h1 {{ color: #38bdf8; font-weight: 700; display: flex; align-items: center; gap: 10px; margin-top: 0; }}
+        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .card {{ background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }}
+        .card h3 {{ margin: 0 0 10px 0; color: var(--sub); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .card .val {{ font-size: 2.2rem; font-weight: bold; }}
+        .filter-bar {{ margin-bottom: 20px; display: flex; gap: 10px; }}
+        .btn {{ background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 0.9rem; transition: all 0.2s; }}
+        .btn:hover {{ border-color: #38bdf8; color: #38bdf8; }}
+        table {{ width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }}
+        th, td {{ padding: 14px 18px; text-align: left; border-bottom: 1px solid var(--border); }}
+        th {{ background: #1a2336; color: var(--sub); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .badge {{ padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; display: inline-block; }}
+        .SAFE {{ background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3); }}
+        .SUSPICIOUS {{ background: rgba(250, 204, 21, 0.15); color: #facc15; border: 1px solid rgba(250, 204, 21, 0.3); }}
+        .MALICIOUS {{ background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3); }}
+        code {{ background: #0b0f19; padding: 3px 8px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem; color: #e2e8f0; }}
     </style>
 </head>
 <body>
-    <h1>ModelSentry Security Audit Report</h1>
+    <h1>🛡️ ModelSentry Security Audit Dashboard</h1>
     <div class="summary">
-        <h3>Scan Overview</h3>
-        <p>Total Scanned: <strong>{total}</strong> | Safe: <span class="SAFE">{safe}</span> | Suspicious: <span class="SUSPICIOUS">{suspicious}</span> | Malicious: <span class="MALICIOUS">{malicious}</span></p>
+        <div class="card"><h3>Total Models</h3><div class="val">{total}</div></div>
+        <div class="card"><h3>Safe</h3><div class="val" style="color:#4ade80">{safe}</div></div>
+        <div class="card"><h3>Suspicious</h3><div class="val" style="color:#facc15">{suspicious}</div></div>
+        <div class="card"><h3>Malicious</h3><div class="val" style="color:#f87171">{malicious}</div></div>
     </div>
+    
     <table>
         <thead>
             <tr>
                 <th>File Path</th>
-                <th>Type</th>
-                <th>SHA-256</th>
+                <th>Format</th>
+                <th>Risk Score</th>
                 <th>Verdict</th>
-                <th>Reasons / Findings</th>
+                <th>Security Findings</th>
             </tr>
         </thead>
         <tbody>
 """
         for r in results:
-            sha = r.get('sha256', 'N/A')
             reasons = "<br>".join(r['reasons'])
+            score = r.get("risk_score", 0.0)
+            sev = r.get("severity", "SAFE")
             html_content += f"""            <tr>
                 <td><code>{r['filepath']}</code></td>
                 <td>{r['file_type']}</td>
-                <td><code>{sha[:16]}...</code></td>
-                <td class="{r['verdict']}">{r['verdict']}</td>
+                <td><strong>{score} / 10</strong> ({sev})</td>
+                <td><span class="badge {r['verdict']}">{r['verdict']}</span></td>
                 <td>{reasons}</td>
             </tr>\n"""
         html_content += """        </tbody>
@@ -190,27 +289,27 @@ def export_report(results, output_path):
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
     else:
-        md_content = f"# ModelSentry Security Audit Report\n\n"
+        md_content = f"# 🛡️ ModelSentry Security Audit Report\n\n"
         md_content += f"## Scan Summary\n"
-        md_content += f"- **Total Scanned**: {total}\n"
+        md_content += f"- **Total Models Scanned**: {total}\n"
         md_content += f"- **SAFE**: {safe}\n"
         md_content += f"- **SUSPICIOUS**: {suspicious}\n"
         md_content += f"- **MALICIOUS**: {malicious}\n\n"
-        md_content += f"## Detailed Findings\n\n"
-        md_content += f"| File Path | Format | SHA-256 Digest | Verdict | Reasons / Findings |\n"
+        md_content += f"## Detailed Security Findings\n\n"
+        md_content += f"| File Path | Format | Risk Score | Verdict | Security Findings |\n"
         md_content += f"|---|---|---|---|---|\n"
         for r in results:
-            sha = r.get('sha256', 'N/A')
             reasons = "<br>".join(r['reasons'])
-            md_content += f"| `{r['filepath']}` | {r['file_type']} | `{sha[:12]}...` | **{r['verdict']}** | {reasons} |\n"
+            score = r.get("risk_score", 0.0)
+            md_content += f"| `{r['filepath']}` | {r['file_type']} | {score} / 10 | **{r['verdict']}** | {reasons} |\n"
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(md_content)
             
-    console.print(f"[bold green]Security report successfully exported to:[/bold green] {output_path}")
+    console.print(f"[bold green]Security report exported to:[/bold green] {output_path}")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ModelSentry - Static Malware Scanner for AI Model Files (.pkl, .pt, .h5, .safetensors)"
+        description="ModelSentry - Advanced Static Malware Scanner for AI Model Files (.pkl, .pt, .h5, .safetensors, .gguf, .onnx, .npy, .npz)"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     
@@ -219,14 +318,18 @@ def main():
     scan_parser.add_argument("path", help="Path to local file or directory to scan")
     scan_parser.add_argument("-r", "--recursive", action="store_true", help="Scan subdirectories recursively")
     scan_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    scan_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report for GitHub Security")
     scan_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     scan_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
     scan_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
+    scan_parser.add_argument("--threads", type=int, default=4, help="Number of worker threads for parallel scanning")
+    scan_parser.add_argument("--config", help="Path to custom config file (.modelsentryrc or modelsentry.json)")
     
     # scan-url command
     url_parser = subparsers.add_parser("scan-url", help="Download and scan a model from a remote URL")
     url_parser.add_argument("url", help="URL of the model file")
     url_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    url_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report")
     url_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     url_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
     url_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
@@ -235,17 +338,24 @@ def main():
     urls_parser = subparsers.add_parser("scan-urls", help="Scan multiple URLs from a text file (one URL per line)")
     urls_parser.add_argument("file", help="Path to text file containing list of URLs")
     urls_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    urls_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report")
     urls_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     urls_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
     urls_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
+    urls_parser.add_argument("--threads", type=int, default=4, help="Number of concurrent worker threads")
     
     args = parser.parse_args()
     
-    results = []
+    # Load config file
+    config = load_config_file(getattr(args, "config", None))
     
-    from scanner import load_custom_rules_file
-    custom_blocklist = load_custom_rules_file(getattr(args, "blocklist", None))
-    custom_allowlist = load_custom_rules_file(getattr(args, "allowlist", None))
+    blocklist_path = getattr(args, "blocklist", None) or config.get("blocklist")
+    allowlist_path = getattr(args, "allowlist", None) or config.get("allowlist")
+    
+    custom_blocklist = load_custom_rules_file(blocklist_path)
+    custom_allowlist = load_custom_rules_file(allowlist_path)
+    
+    results = []
     
     if args.command == "scan":
         files = get_all_files(args.path, recursive=args.recursive)
@@ -253,11 +363,21 @@ def main():
             console.print(f"[bold red]Error:[/bold red] No files found at '{args.path}' to scan.")
             sys.exit(1)
             
-        for filepath in files:
-            results.append(scan_file(filepath, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist))
+        threads = getattr(args, "threads", 4)
+        if len(files) > 1 and threads > 1:
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                future_to_file = {
+                    executor.submit(scan_file, f, custom_blocklist, custom_allowlist): f 
+                    for f in files
+                }
+                for future in as_completed(future_to_file):
+                    results.append(future.result())
+        else:
+            for filepath in files:
+                results.append(scan_file(filepath, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist))
             
     elif args.command == "scan-url":
-        res = handle_url_scan(args.url, is_json=args.json)
+        res = handle_url_scan(args.url, is_json=args.json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist)
         results.append(res)
         
     elif args.command == "scan-urls":
@@ -266,10 +386,17 @@ def main():
             sys.exit(1)
         with open(args.file, 'r', encoding='utf-8') as f:
             urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        for u in urls:
-            results.append(handle_url_scan(u, is_json=args.json))
+            
+        threads = getattr(args, "threads", 4)
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            future_to_url = {
+                executor.submit(handle_url_scan, u, is_json=args.json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist): u
+                for u in urls
+            }
+            for future in as_completed(future_to_url):
+                results.append(future.result())
         
-    # Output presentation
+    # Presentation
     if args.json:
         print(json.dumps(results, indent=2))
     else:
@@ -278,12 +405,11 @@ def main():
     if getattr(args, "export_report", None):
         export_report(results, args.export_report)
         
-    # Set exit code: 1 if any malicious files detected
+    if getattr(args, "sarif", None):
+        export_sarif_report(results, args.sarif)
+        
     any_malicious = any(r["verdict"] == "MALICIOUS" for r in results)
-    if any_malicious:
-        sys.exit(1)
-    else:
-        sys.exit(0)
+    sys.exit(1 if any_malicious else 0)
 
 if __name__ == "__main__":
     main()

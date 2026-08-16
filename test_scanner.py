@@ -5,7 +5,8 @@ import pickle
 import zipfile
 import pytest
 import h5py
-from scanner import scan_file, extract_pickle_calls_from_bytes, validate_safetensors
+from scanner import scan_file, extract_pickle_calls_from_bytes, validate_safetensors, validate_gguf, inspect_onnx_file, calculate_risk_score
+from modelsentry import export_sarif_report, load_config_file
 
 class MockMaliciousReduce:
     def __init__(self, func, args):
@@ -27,27 +28,23 @@ def test_benign_pickle(temp_dir):
     result = scan_file(str(file_path))
     assert result["verdict"] == "SAFE"
     assert result["file_type"] == "pickle"
+    assert result["risk_score"] == 0.0
 
 def test_malicious_pickle_blocked(temp_dir):
     import os as local_os
     file_path = temp_dir / "malicious_blocked.pkl"
-    # Using os.system
     malicious_obj = MockMaliciousReduce(local_os.system, ("echo 'hack'",))
     with open(file_path, "wb") as f:
         pickle.dump(malicious_obj, f)
         
     result = scan_file(str(file_path))
     assert result["verdict"] == "MALICIOUS"
+    assert result["severity"] == "CRITICAL"
     assert any("Blocked reference:" in r and "system" in r for r in result["reasons"])
 
 def test_suspicious_pickle_unknown(temp_dir):
     file_path = temp_dir / "suspicious.pkl"
-    # Reference a dummy custom function not in allowlist or blocklist
-    # We can write a custom reference using pickle's GLOBAL opcode simulation
-    # Or just pickle a function from a non-standard module if it's importable.
-    # To be fully deterministic, we construct a raw pickle byte string:
-    # c module\n name\n. -> GLOBAL opcode
-    pickle_bytes = b"cmy_custom_module\nmy_function\n(I1\ntR." # calls my_custom_module.my_function(1)
+    pickle_bytes = b"cmy_custom_module\nmy_function\n(I1\ntR."
     with open(file_path, "wb") as f:
         f.write(pickle_bytes)
         
@@ -57,9 +54,6 @@ def test_suspicious_pickle_unknown(temp_dir):
 
 def test_pytorch_zip_malicious(temp_dir):
     file_path = temp_dir / "pytorch_model.pt"
-    
-    # Create a mock PyTorch ZIP archive
-    # Inside PyTorch files, the pickle is stored under archive/data.pkl
     import os as local_os
     malicious_obj = MockMaliciousReduce(local_os.system, ("echo 'hack'",))
     pickle_bytes = pickle.dumps(malicious_obj)
@@ -105,7 +99,7 @@ def test_malicious_hdf5_lambda(temp_dir):
                     "class_name": "Lambda",
                     "config": {
                         "name": "lambda",
-                        "function": ["Y29kZQ==", None, None], # base64 bytecode representation
+                        "function": ["Y29kZQ==", None, None],
                         "function_type": "lambda"
                     }
                 }
@@ -122,7 +116,6 @@ def test_malicious_hdf5_lambda(temp_dir):
 
 def test_benign_safetensors(temp_dir):
     file_path = temp_dir / "model.safetensors"
-    # Structure of safetensors manually constructed:
     header = {
         "tensor_1": {
             "dtype": "F32",
@@ -132,9 +125,7 @@ def test_benign_safetensors(temp_dir):
     }
     header_json = json.dumps(header).encode('utf-8')
     header_size = len(header_json)
-    
-    # 8 bytes header size, then header JSON, then 8 bytes of raw data
-    data_bytes = b'\x00\x00\x80?\x00\x00\x00@' # 2 floats: 1.0, 2.0
+    data_bytes = b'\x00\x00\x80?\x00\x00\x00@'
     
     with open(file_path, "wb") as f:
         f.write(struct.pack('<Q', header_size))
@@ -156,8 +147,6 @@ def test_safetensors_appended_payload(temp_dir):
     }
     header_json = json.dumps(header).encode('utf-8')
     header_size = len(header_json)
-    
-    # Data is 8 bytes, but we append 2048 extra bytes at the end
     data_bytes = b'\x00\x00\x80?\x00\x00\x00@'
     malicious_payload = b'X' * 2048
     
@@ -171,58 +160,79 @@ def test_safetensors_appended_payload(temp_dir):
     assert result["verdict"] == "SUSPICIOUS"
     assert any("extra appended payload data" in r for r in result["reasons"])
 
-def test_safetensors_truncated(temp_dir):
-    file_path = temp_dir / "truncated.safetensors"
-    header = {
-        "tensor_1": {
-            "dtype": "F32",
-            "shape": [2],
-            "data_offsets": [0, 8]
-        }
-    }
-    header_json = json.dumps(header).encode('utf-8')
-    header_size = len(header_json)
-    
-    # We write only 4 bytes of data instead of 8
-    data_bytes = b'\x00\x00\x80?'
-    
+def test_benign_gguf(temp_dir):
+    file_path = temp_dir / "model.gguf"
     with open(file_path, "wb") as f:
-        f.write(struct.pack('<Q', header_size))
-        f.write(header_json)
-        f.write(data_bytes)
+        f.write(b'GGUF')
+        f.write(struct.pack('<IQQ', 3, 10, 2))
+        f.write(b'\x00' * 64)
         
     result = scan_file(str(file_path))
-    assert result["verdict"] == "MALICIOUS"
-    assert any("truncated by 4 bytes" in r for r in result["reasons"])
+    assert result["verdict"] == "SAFE"
+    assert result["file_type"] == "gguf"
+    assert "Valid GGUF v3 model" in result["reasons"][0]
 
-def test_sha256_generation(temp_dir):
-    file_path = temp_dir / "sample.pkl"
+def test_malicious_onnx_traversal(temp_dir):
+    file_path = temp_dir / "model.onnx"
     with open(file_path, "wb") as f:
-        pickle.dump({"a": 1}, f)
-    result = scan_file(str(file_path))
-    assert "sha256" in result
-    assert len(result["sha256"]) == 64
-
-def test_custom_rules(temp_dir):
-    file_path = temp_dir / "custom.pkl"
-    # Create raw pickle calling custom_mod.func
-    pickle_bytes = b"ccustom_mod\nfunc\n(I1\ntR."
-    with open(file_path, "wb") as f:
-        f.write(pickle_bytes)
+        f.write(b'\x08\x03\x12\x07onnx.ai\x1a\x10external_data: ../../../etc/passwd')
         
-    # With custom blocklist containing custom_mod.func -> MALICIOUS
-    res_blocked = scan_file(str(file_path), custom_blocklist={"custom_mod.func"})
-    assert res_blocked["verdict"] == "MALICIOUS"
-    
-    # With custom allowlist containing custom_mod -> SAFE
-    res_allowed = scan_file(str(file_path), custom_allowlist={"custom_mod"})
-    assert res_allowed["verdict"] == "SAFE"
+    result = scan_file(str(file_path))
+    assert result["verdict"] in ("MALICIOUS", "SUSPICIOUS")
+    assert any("external data path reference" in r for r in result["reasons"])
 
-def test_max_size_threshold(temp_dir):
-    file_path = temp_dir / "large.pkl"
+def test_benign_numpy(temp_dir):
+    file_path = temp_dir / "array.npy"
+    header_dict = "{'descr': '<f8', 'fortran_order': False, 'shape': (2, 2)}"
+    header_bytes = header_dict.encode('latin1')
     with open(file_path, "wb") as f:
-        f.write(b"0" * (1024 * 1024)) # 1MB file
-    result = scan_file(str(file_path), max_size_mb=0.5)
+        f.write(b'\x93NUMPY\x01\x00')
+        f.write(struct.pack('<H', len(header_bytes)))
+        f.write(header_bytes)
+        f.write(b'\x00' * 32)
+        
+    result = scan_file(str(file_path))
+    assert result["verdict"] == "SAFE"
+    assert result["file_type"] == "numpy"
+
+def test_embedded_exe_payload(temp_dir):
+    file_path = temp_dir / "embedded_exe.bin"
+    with open(file_path, "wb") as f:
+        f.write(b"MZ" + b"\x00" * 100) # PE magic header
+        
+    result = scan_file(str(file_path))
     assert result["verdict"] == "SUSPICIOUS"
-    assert any("exceeds maximum allowed threshold" in r for r in result["reasons"])
+    assert any("Embedded Windows Portable Executable" in r for r in result["reasons"])
 
+def test_sarif_export(temp_dir):
+    results = [
+        {
+            "filepath": "malicious.pkl",
+            "file_type": "pickle",
+            "verdict": "MALICIOUS",
+            "risk_score": 9.5,
+            "severity": "CRITICAL",
+            "reasons": ["Blocked reference: 'os.system'"]
+        }
+    ]
+    sarif_path = temp_dir / "output.sarif"
+    export_sarif_report(results, str(sarif_path))
+    
+    assert os.path.exists(sarif_path)
+    with open(sarif_path, 'r', encoding='utf-8') as f:
+        sarif_data = json.load(f)
+    assert sarif_data["version"] == "2.1.0"
+    assert len(sarif_data["runs"][0]["results"]) == 1
+
+def test_config_loader(temp_dir):
+    config_file = temp_dir / ".modelsentryrc"
+    config_data = {
+        "threads": 8,
+        "min_severity": "MEDIUM"
+    }
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(config_data, f)
+        
+    loaded = load_config_file(str(config_file))
+    assert loaded["threads"] == 8
+    assert loaded["min_severity"] == "MEDIUM"

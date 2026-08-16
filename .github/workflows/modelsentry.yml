@@ -1,0 +1,42 @@
+name: ModelSentry Security Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '0 0 * * 1'
+
+jobs:
+  security-scan:
+    name: Model Security & Bytecode Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install h5py rich pytest safetensors
+
+      - name: Run Test Suite
+        run: |
+          pytest test_scanner.py -v
+
+      - name: Scan Repository Models (SARIF Export)
+        run: |
+          python modelsentry.py scan . --recursive --sarif results.sarif --export-report report.html || true
+
+      - name: Upload SARIF Security Findings
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: modelsentry

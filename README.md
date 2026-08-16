@@ -1,20 +1,23 @@
-# 🛡️ ModelSentry — Static Malware Scanner for AI Model Artifacts
+# 🛡️ ModelSentry — Static Malware & Payload Scanner for AI Model Artifacts
 
-**ModelSentry** is a lightweight, zero-execution security scanner designed to inspect Machine Learning model files for arbitrary code execution vectors and embedded malware payloads. 
+**ModelSentry** is a lightweight, zero-execution security scanner designed to inspect Machine Learning model files for arbitrary code execution vectors, embedded malware payloads, and path traversal vulnerabilities.
 
-It statically analyzes `.pkl` (Pickle), `.pt`/`.pth` (PyTorch weights), `.h5` (Keras/HDF5), and `.safetensors` files **without ever executing or loading them into memory**.
+It statically analyzes `.pkl` (Pickle), `.pt`/`.pth` (PyTorch weights), `.h5` (Keras/HDF5), `.safetensors`, `.gguf`/`.ggml` (llama.cpp format), `.onnx` (Open Neural Network Exchange), and `.npy`/`.npz` (NumPy binary arrays) **without ever executing or loading them into memory**.
 
 ---
 
 ## 1. The Security Problem
 
-Machine learning model files are often treated as simple data assets, but popular formats can execute arbitrary code on the user's system the moment they are loaded:
+Machine learning model files are often treated as simple data assets, but popular formats can execute arbitrary code or exfiltrate system data the moment they are loaded:
 
-*   **Pickle-based formats (`.pkl`, `.pt`, `.pth`)**: PyTorch's default save mechanism uses Python's standard `pickle` library. Attackers can embed `GLOBAL` or `STACK_GLOBAL` opcodes coupled with a `REDUCE` instruction in the bytecode. Upon loading via `torch.load()` or `pickle.load()`, the model will automatically invoke importable Python functions like `os.system` or `subprocess.Popen` without user consent.
-*   **HDF5 formats (`.h5`)**: Keras models saved in the HDF5 format can contain serialized custom `Lambda` layers. These store raw serialized Python bytecode inside the file's HDF5 metadata, executing it upon calling `load_model()`.
-*   **Safetensors (`.safetensors`)**: Designed to be a safe, data-only format, safetensors itself does not execute code. However, attackers can append malicious binary payloads to the end of a valid safetensors file (outside of the declared tensor offsets) to hide executables or payloads in a supply chain attack.
+*   **Pickle-based formats (`.pkl`, `.pt`, `.pth`)**: PyTorch's default save mechanism uses Python's standard `pickle` library. Attackers embed `GLOBAL` or `STACK_GLOBAL` opcodes coupled with a `REDUCE` instruction in the bytecode. Upon loading via `torch.load()` or `pickle.load()`, the model automatically invokes importable Python functions like `os.system` or `subprocess.Popen`.
+*   **HDF5 formats (`.h5`)**: Keras models saved in HDF5 format can contain serialized custom `Lambda` layers. These store raw serialized Python bytecode inside the file's HDF5 metadata, executing it upon calling `load_model()`.
+*   **Safetensors (`.safetensors`)**: Safetensors is designed to be a safe, data-only format. However, attackers can append malicious binary payloads outside the declared tensor byte offsets to hide executables in a supply chain attack.
+*   **ONNX models (`.onnx`)**: Malicious ONNX models can contain `external_data` references specifying path traversal relative paths (`../../etc/passwd` or system paths) or embed malicious script commands within operator metadata.
+*   **GGUF models (`.gguf`, `.ggml`)**: llama.cpp GGUF files contain binary key-value metadata headers and tensor offset maps that can be manipulated to hide secondary payloads or exploit parser overflow vulnerabilities.
+*   **NumPy arrays (`.npy`, `.npz`)**: Arrays containing Python object types (`OBJECT` / `descr: |O`) trigger `pickle` execution upon loading if `allow_pickle=True`.
 
-ModelSentry addresses these attack vectors by scanning the model structures purely through static disassembling and header verification.
+ModelSentry addresses these attack vectors by scanning model structures purely through static disassembling, structural validation, entropy analysis, and pattern matching.
 
 ---
 
@@ -22,14 +25,15 @@ ModelSentry addresses these attack vectors by scanning the model structures pure
 
 ModelSentry is structured into multiple validation layers:
 
-1.  **File Type Sniffer**: Detects the model format using magic bytes (HDF5 magic, ZIP headers for modern PyTorch archives, Safetensors header length) or file extensions.
+1.  **File Type Sniffer**: Detects model format using magic bytes (`GGUF`, HDF5 magic, `\x93NUMPY`, ZIP headers for modern PyTorch archives, Safetensors header length) or file extensions.
 2.  **Pickle Opcode Emulator**: Uses `pickletools` to disassemble raw pickle byte streams or pickle segments stored inside PyTorch zip archives (e.g. `archive/data.pkl`). It simulates the pickle VM stack to dynamically resolve both `GLOBAL` and `STACK_GLOBAL` (Protocol 4+) opcodes to identify all referenced modules/functions.
-3.  **HDF5 Structure Inspector**: Opens `.h5` files in read-only mode using `h5py` and extracts the model's Keras layer configuration metadata. It recursively inspects the JSON definition to look for the presence of dangerous `"class_name": "Lambda"` layer structures.
-4.  **Safetensors Header Validator**: Reads the 8-byte header size prefix, validates the JSON header size boundary (< 100MB), and ensures that the sum of declared tensor offsets matches the actual file size. This reliably catches files containing appended payloads/executables.
-5.  **Rule Engine & Verdict Scorer**: Compares all resolved references against a strict blocklist (e.g., `os`, `subprocess`, `sys`, `socket`, `ctypes`, `eval`, `exec`) and an allowlist of standard ML libraries (`torch`, `numpy`, `collections`, etc.).
-    *   **SAFE**: The file only contains references within the allowlist and matches standard layouts.
-    *   **SUSPICIOUS**: The file contains unverified custom modules or minor deviations (e.g. appended payloads in Safetensors).
-    *   **MALICIOUS**: The file contains explicit blocklisted calls or dangerous executable Keras Lambda layers.
+3.  **HDF5 Structure Inspector**: Opens `.h5` files in read-only mode using `h5py` and extracts model configuration metadata. It recursively inspects the JSON definition for dangerous `"class_name": "Lambda"` layer structures.
+4.  **Safetensors Header Validator**: Reads the 8-byte header size prefix, validates the JSON header size boundary (< 100MB), and ensures that declared tensor offsets match the actual file size to catch appended payload data.
+5.  **GGUF & GGML Inspector**: Parses GGUF binary headers (magic `GGUF`/`0x46554747`), checks key-value metadata for malicious payload URLs, and verifies tensor boundaries.
+6.  **ONNX Graph & Metadata Scanner**: Statically inspects ONNX model protobuf files to detect `external_data` directory escape attempts (`..`) and custom operator domain vulnerabilities.
+7.  **NumPy / NPZ Object Scanner**: Inspects `.npy` and `.npz` headers for serialized Python object types and pickle opcodes.
+8.  **Entropy & Payload Detector**: Calculates Shannon entropy across file windows to detect encrypted/compressed shellcode, and checks raw byte streams for embedded executable signatures (PE `MZ`, ELF `\x7fELF`, Mach-O).
+9.  **Rule & Risk Scoring Engine**: Evaluates findings against custom or built-in blocklists/allowlists, assigns a numerical **Risk Score (0.0 to 10.0)**, and categorizes findings by severity (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `SAFE`).
 
 ---
 
@@ -45,8 +49,8 @@ cd ModelSentry
 python -m venv .venv
 source .venv/bin/activate  # Or on Windows: .venv\Scripts\activate
 
-# Install dependencies
-pip install h5py rich pytest safetensors
+# Install package or dependencies
+pip install -e .
 ```
 
 ---
@@ -56,63 +60,88 @@ pip install h5py rich pytest safetensors
 ### Scanning a Local File
 To scan a single model weights file:
 ```bash
-python modelsentry.py scan SAMPLES/malicious_hdf5.h5
+modelsentry scan SAMPLES/malicious_hdf5.h5
 ```
 
-### Scanning a Directory (with Recursive Option)
-To scan a downloaded model repository folder:
+### Scanning a Directory (Multithreaded & Recursive)
+To scan a downloaded model repository folder using multi-core parallel worker threads:
 ```bash
-python modelsentry.py scan SAMPLES/ --recursive
+modelsentry scan SAMPLES/ --recursive --threads 8
+```
+
+### Exporting SARIF v2.1.0 Reports for GitHub Security
+Generate OASIS SARIF v2.1.0 reports for native GitHub Code Scanning integration:
+```bash
+modelsentry scan SAMPLES/ --recursive --sarif results.sarif
 ```
 
 ### Outputting JSON for CI/CD Pipelines
-Integrate ModelSentry into automated security workflows by outputting machine-readable JSON:
+Integrate ModelSentry into automated security workflows:
 ```bash
-python modelsentry.py scan SAMPLES/ --recursive --json
+modelsentry scan SAMPLES/ --recursive --json
 ```
 
-### Exporting Security Audit Reports (HTML & Markdown)
-Generate standalone security audit reports for compliance and security reviews:
+### Exporting Interactive HTML & Markdown Audit Reports
+Generate standalone security audit reports:
 ```bash
-python modelsentry.py scan SAMPLES/ --recursive --export-report report.html
-python modelsentry.py scan SAMPLES/ --recursive --export-report report.md
+modelsentry scan SAMPLES/ --recursive --export-report audit.html
+modelsentry scan SAMPLES/ --recursive --export-report audit.md
 ```
 
 ### Custom Blocklist & Allowlist Rules
 Supply custom rules via text or JSON files:
 ```bash
-python modelsentry.py scan SAMPLES/ --blocklist custom_blocklist.txt --allowlist custom_allowlist.txt
+modelsentry scan SAMPLES/ --blocklist custom_blocklist.txt --allowlist custom_allowlist.txt
 ```
 
 ### Scanning Remote URLs & Batch URL Lists
 Perform pre-download safety checks for single remote models or batch lists of model URLs:
 ```bash
 # Single URL
-python modelsentry.py scan-url https://example.com/path/to/model.pt
+modelsentry scan-url https://example.com/path/to/model.pt
 
 # Batch list of URLs from a text file (one URL per line)
-python modelsentry.py scan-urls url_list.txt --export-report batch_audit.html
+modelsentry scan-urls url_list.txt --export-report batch_audit.html
 ```
 
 ---
 
-## 5. Directory Structure
+## 5. Configuration File (`.modelsentryrc` / `modelsentry.json`)
+
+You can create a `.modelsentryrc` or `modelsentry.json` file in your project root to set persistent scanner defaults:
+
+```json
+{
+  "threads": 8,
+  "max_size_mb": 500,
+  "min_severity": "MEDIUM",
+  "blocklist": "custom_blocklist.txt",
+  "allowlist": "custom_allowlist.txt"
+}
+```
+
+---
+
+## 6. Directory Structure
 
 ```
 ModelSentry/
-├── modelsentry.py      # CLI Entrypoint
-├── scanner.py          # Main Scanner and Rule Engine
-├── test_scanner.py     # Automated Pytest Suite
-├── generate_samples.py # Script to create mock models for testing
-├── SAMPLES/            # Tiny generated benign & malicious model samples
-└── README.md           # Documentation
+├── modelsentry.py              # CLI Entrypoint & Reporting Engine
+├── scanner.py                  # Static Scanners & Heuristic Engine
+├── test_scanner.py             # Automated Pytest Suite
+├── generate_samples.py         # Test model generator
+├── pyproject.toml              # Python Package Setup
+├── .github/workflows/          # GitHub Actions CI Workflow
+│   └── modelsentry.yml
+├── SAMPLES/                    # Generated benign & malicious test models
+└── README.md                   # Documentation
 ```
 
 ---
 
-## 6. Verification & Testing
+## 7. Verification & Testing
 
-Verify that all scanning layers are operating correctly by running the test suite:
+Verify all scanning layers by running the automated pytest suite:
 
 ```bash
 pytest test_scanner.py -v
@@ -120,6 +149,6 @@ pytest test_scanner.py -v
 
 ---
 
-## 7. License
+## 8. License
 
 This project is licensed under the MIT License.
