@@ -7,6 +7,8 @@ import zipfile
 import pickletools
 import hashlib
 
+import fnmatch
+
 def calculate_sha256(filepath):
     """Calculates the SHA-256 hex digest of a file."""
     hasher = hashlib.sha256()
@@ -24,7 +26,8 @@ BLOCKLIST = {
     'os', 'subprocess', 'sys', 'socket', 'shutil', 'pty', 'ctypes', 
     'webbrowser', 'tempfile', 'requests', 'urllib', 'posix', 'nt', 
     'platform', 'runpy', 'importlib', 'code', 'pdb', 'commands', 
-    'multiprocessing', 'threading',
+    'multiprocessing', 'threading', 'asyncio', 'winreg', 'ftplib',
+    'poplib', 'smtplib', 'http.client', 'pickle', 'marshal',
     # Builtins and execution
     'builtins.eval', 'builtins.exec', 'builtins.compile', 'builtins.__import__', 
     'builtins.open', 'builtins.input', 'builtins.getattr', 'builtins.setattr',
@@ -64,6 +67,50 @@ def load_custom_rules_file(filepath):
     except Exception:
         pass
     return entries
+
+def load_ignore_file(filepath=None):
+    """
+    Loads suppression rules from a .modelsentryignore file or custom ignore file path.
+    Entries can be file path patterns, SHA256 hashes, or specific rule / module substrings.
+    """
+    entries = set()
+    paths_to_check = [filepath] if filepath else [".modelsentryignore"]
+    for path in paths_to_check:
+        if path and os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            entries.add(line)
+                break
+            except Exception:
+                pass
+    return entries
+
+def is_ignored(filepath, sha256_hash, reason_or_call, ignore_entries):
+    """
+    Checks if a specific file, hash, or finding reason matches any ignore entry.
+    """
+    if not ignore_entries:
+        return False
+    norm_path = os.path.normpath(filepath).replace('\\', '/')
+    for entry in ignore_entries:
+        entry_str = entry.strip()
+        if not entry_str:
+            continue
+        entry_norm = os.path.normpath(entry_str).replace('\\', '/')
+        if entry_norm == norm_path or fnmatch.fnmatch(norm_path, entry_norm) or entry_norm == sha256_hash or (sha256_hash and sha256_hash.startswith(entry_norm)):
+            return True
+        if reason_or_call:
+            if entry_str in reason_or_call:
+                return True
+            if entry_str.startswith('os.') and entry_str.replace('os.', 'nt.', 1) in reason_or_call:
+                return True
+            if entry_str.startswith('os.') and entry_str.replace('os.', 'posix.', 1) in reason_or_call:
+                return True
+    return False
+
 
 def is_allowlisted(ref: str, custom_allowlist=None) -> bool:
     """
@@ -536,11 +583,25 @@ def calculate_risk_score(verdict, reasons, file_type):
         
     return round(score, 1), severity
 
-def scan_file(filepath, custom_blocklist=None, custom_allowlist=None, max_size_mb=None):
+def scan_file(filepath, custom_blocklist=None, custom_allowlist=None, max_size_mb=None, ignore_file=None, ignore_entries=None):
     """
     Routes the file to the correct scanner layer and returns a verdict dictionary.
     """
     sha256_hash = calculate_sha256(filepath)
+    active_ignores = ignore_entries if ignore_entries is not None else load_ignore_file(ignore_file)
+
+    if active_ignores and is_ignored(filepath, sha256_hash, "", active_ignores):
+        return {
+            "filepath": filepath,
+            "sha256": sha256_hash,
+            "file_type": "ignored",
+            "verdict": "SAFE",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "reasons": ["Suppressed by ignore rules"],
+            "details": {}
+        }
+
     if not os.path.exists(filepath):
         return {
             "filepath": filepath,
@@ -679,6 +740,15 @@ def scan_file(filepath, custom_blocklist=None, custom_allowlist=None, max_size_m
         reasons.extend(pattern_findings)
         if verdict == "SAFE":
             verdict = "SUSPICIOUS"
+
+    # Filter out findings matched by ignore entries
+    if active_ignores and reasons:
+        filtered_reasons = [r for r in reasons if not is_ignored(filepath, sha256_hash, r, active_ignores)]
+        if not filtered_reasons:
+            verdict = "SAFE"
+            reasons = ["All security findings suppressed by ignore rules"]
+        else:
+            reasons = filtered_reasons
 
     risk_score, severity = calculate_risk_score(verdict, reasons, file_type)
     

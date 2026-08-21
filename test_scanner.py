@@ -5,8 +5,8 @@ import pickle
 import zipfile
 import pytest
 import h5py
-from scanner import scan_file, extract_pickle_calls_from_bytes, validate_safetensors, validate_gguf, inspect_onnx_file, calculate_risk_score
-from modelsentry import export_sarif_report, load_config_file
+from scanner import scan_file, load_ignore_file, extract_pickle_calls_from_bytes, validate_safetensors, validate_gguf, inspect_onnx_file, calculate_risk_score
+from modelsentry import export_sarif_report, load_config_file, init_pre_commit_hook, handle_hf_scan
 
 class MockMaliciousReduce:
     def __init__(self, func, args):
@@ -236,3 +236,65 @@ def test_config_loader(temp_dir):
     loaded = load_config_file(str(config_file))
     assert loaded["threads"] == 8
     assert loaded["min_severity"] == "MEDIUM"
+
+def test_ignore_file_suppression(temp_dir):
+    import os as local_os
+    file_path = temp_dir / "malicious_ignored.pkl"
+    malicious_obj = MockMaliciousReduce(local_os.system, ("echo 'hack'",))
+    with open(file_path, "wb") as f:
+        pickle.dump(malicious_obj, f)
+        
+    ignore_file = temp_dir / ".modelsentryignore"
+    with open(ignore_file, "w", encoding="utf-8") as f:
+        f.write("# Ignore rules\n")
+        f.write("os.system\n")
+        
+    result = scan_file(str(file_path), ignore_file=str(ignore_file))
+    assert result["verdict"] == "SAFE"
+    assert "suppressed" in result["reasons"][0].lower()
+
+def test_init_git_hook(temp_dir, monkeypatch):
+    monkeypatch.chdir(temp_dir)
+    os.makedirs(".git", exist_ok=True)
+    success = init_pre_commit_hook(force=True)
+    assert success is True
+    hook_file = temp_dir / ".git" / "hooks" / "pre-commit"
+    assert os.path.exists(hook_file)
+    with open(hook_file, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "ModelSentry Pre-Commit Check" in content
+
+def test_hf_repo_parser(monkeypatch):
+    fake_tree = [
+        {"path": "config.json", "type": "file"},
+        {"path": "model.safetensors", "type": "file"},
+        {"path": "pytorch_model.bin", "type": "file"}
+    ]
+    class MockResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return json.dumps(fake_tree).encode('utf-8')
+
+    def mock_urlopen(req):
+        return MockResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+    monkeypatch.setattr("modelsentry.handle_url_scan", lambda u, *args, **kw: {"filepath": u, "verdict": "SAFE", "reasons": ["Mock clean"]})
+
+    results = handle_hf_scan("fake/repo", is_json=True)
+    assert len(results) == 2
+    assert any("model.safetensors" in r["filepath"] for r in results)
+
+def test_expanded_blocklist(temp_dir):
+    file_path = temp_dir / "blocked_module.pkl"
+    pickle_bytes = b"cwinreg\nOpenKey\n(I1\ntR."
+    with open(file_path, "wb") as f:
+        f.write(pickle_bytes)
+        
+    result = scan_file(str(file_path))
+    assert result["verdict"] == "MALICIOUS"
+    assert any("winreg" in r for r in result["reasons"])
+

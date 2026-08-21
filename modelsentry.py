@@ -10,7 +10,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from scanner import scan_file, load_custom_rules_file
+from scanner import scan_file, load_custom_rules_file, load_ignore_file
 
 if sys.platform == "win32":
     try:
@@ -28,6 +28,7 @@ def load_config_file(config_path=None):
     config = {
         "blocklist": None,
         "allowlist": None,
+        "ignore_file": None,
         "threads": 4,
         "max_size_mb": None,
         "min_severity": "SAFE"
@@ -61,7 +62,7 @@ def get_all_files(path, recursive=False):
                 break
     return files
 
-def handle_url_scan(url, is_json=False, custom_blocklist=None, custom_allowlist=None):
+def handle_url_scan(url, is_json=False, custom_blocklist=None, custom_allowlist=None, ignore_file=None):
     """
     Downloads a file to a temporary location and scans it.
     """
@@ -84,7 +85,7 @@ def handle_url_scan(url, is_json=False, custom_blocklist=None, custom_allowlist=
         else:
             urllib.request.urlretrieve(url, temp_path)
             
-        result = scan_file(temp_path, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist)
+        result = scan_file(temp_path, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist, ignore_file=ignore_file)
         result["filepath"] = url
         
         if os.path.exists(temp_path):
@@ -102,6 +103,120 @@ def handle_url_scan(url, is_json=False, custom_blocklist=None, custom_allowlist=
             "reasons": [f"Failed to download/scan URL: {str(e)}"],
             "details": {}
         }
+
+def handle_hf_scan(repo_id, revision="main", is_json=False, custom_blocklist=None, custom_allowlist=None, ignore_file=None, threads=4):
+    """
+    Scans model weight artifacts in a remote Hugging Face repository without cloning the whole model repo.
+    """
+    clean_repo = repo_id.replace("https://huggingface.co/", "").strip('/')
+    if not is_json:
+        console.print(f"[bold blue]Fetching Hugging Face model repository metadata:[/bold blue] {clean_repo} (branch: {revision})")
+    
+    api_url = f"https://huggingface.co/api/models/{clean_repo}/tree/{revision}"
+    req = urllib.request.Request(api_url, headers={'User-Agent': 'ModelSentry-Scanner/2.0'})
+    
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        return [{
+            "filepath": clean_repo,
+            "sha256": "N/A",
+            "file_type": "none",
+            "verdict": "SUSPICIOUS",
+            "risk_score": 5.0,
+            "severity": "MEDIUM",
+            "reasons": [f"Failed to query Hugging Face API for '{clean_repo}': {str(e)}"],
+            "details": {}
+        }]
+        
+    model_exts = ('.safetensors', '.bin', '.pt', '.pth', '.h5', '.onnx', '.gguf', '.pkl', '.npz', '.npy')
+    target_files = [item['path'] for item in data if isinstance(item, dict) and item.get('type') == 'file' and item.get('path', '').lower().endswith(model_exts)]
+    
+    if not target_files:
+        return [{
+            "filepath": clean_repo,
+            "sha256": "N/A",
+            "file_type": "none",
+            "verdict": "SAFE",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "reasons": [f"No model weight artifacts found in repository root on branch '{revision}'"],
+            "details": {}
+        }]
+        
+    if not is_json:
+        console.print(f"[bold green]Found {len(target_files)} model weight artifact(s) in Hugging Face repository.[/bold green]")
+        
+    urls = [f"https://huggingface.co/{clean_repo}/resolve/{revision}/{fpath}" for fpath in target_files]
+    results = []
+    
+    if len(urls) > 1 and threads > 1:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            future_to_url = {
+                executor.submit(handle_url_scan, u, is_json=is_json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist, ignore_file=ignore_file): u
+                for u in urls
+            }
+            for future in as_completed(future_to_url):
+                results.append(future.result())
+    else:
+        for u in urls:
+            results.append(handle_url_scan(u, is_json=is_json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist, ignore_file=ignore_file))
+            
+    return results
+
+def init_pre_commit_hook(force=False):
+    """
+    Installs a Git pre-commit hook into .git/hooks/pre-commit to scan staged model files.
+    """
+    git_dir = ".git"
+    if not os.path.exists(git_dir):
+        console.print("[bold red]Error:[/bold red] Not a git repository (no .git folder found). Run 'git init' first.")
+        return False
+        
+    hooks_dir = os.path.join(git_dir, "hooks")
+    os.makedirs(hooks_dir, exist_ok=True)
+    hook_path = os.path.join(hooks_dir, "pre-commit")
+    
+    if os.path.exists(hook_path) and not force:
+        console.print(f"[bold yellow]Pre-commit hook already exists at '{hook_path}'.[/bold yellow] Use --force to overwrite.")
+        return False
+        
+    hook_script = """#!/bin/sh
+# ModelSentry Pre-Commit Hook — Prevents committing unsafe AI model weight artifacts
+echo "🛡️ ModelSentry Pre-Commit Check..."
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\\.(pkl|pt|pth|h5|safetensors|gguf|onnx|npy|npz)$')
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "No staged model artifacts found. Skipping scan."
+    exit 0
+fi
+
+echo "Scanning staged model files:"
+echo "$STAGED_FILES"
+
+python modelsentry.py scan $STAGED_FILES
+RESULT=$?
+
+if [ $RESULT -ne 0 ]; then
+    echo "❌ ModelSentry detected security issues in staged model files! Commit aborted."
+    exit 1
+fi
+
+echo "✅ ModelSentry pre-commit check passed!"
+exit 0
+"""
+    with open(hook_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(hook_script)
+        
+    try:
+        os.chmod(hook_path, 0o755)
+    except Exception:
+        pass
+        
+    console.print(f"[bold green]Successfully installed ModelSentry pre-commit hook to:[/bold green] {hook_path}")
+    return True
+
 
 def print_rich_report(results):
     """
@@ -321,6 +436,7 @@ def main():
     scan_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report for GitHub Security")
     scan_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     scan_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    scan_parser.add_argument("--ignore-file", help="Path to custom ignore rules file (.modelsentryignore)")
     scan_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
     scan_parser.add_argument("--threads", type=int, default=4, help="Number of worker threads for parallel scanning")
     scan_parser.add_argument("--config", help="Path to custom config file (.modelsentryrc or modelsentry.json)")
@@ -332,6 +448,7 @@ def main():
     url_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report")
     url_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     url_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    url_parser.add_argument("--ignore-file", help="Path to custom ignore rules file")
     url_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
     
     # scan-urls batch command
@@ -341,16 +458,39 @@ def main():
     urls_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report")
     urls_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
     urls_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    urls_parser.add_argument("--ignore-file", help="Path to custom ignore rules file")
     urls_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
     urls_parser.add_argument("--threads", type=int, default=4, help="Number of concurrent worker threads")
+
+    # scan-hf command
+    hf_parser = subparsers.add_parser("scan-hf", help="Scan remote model weights inside a Hugging Face repository")
+    hf_parser.add_argument("repo_id", help="Hugging Face model repository ID (e.g. 'gpt2' or 'meta-llama/Llama-2-7b')")
+    hf_parser.add_argument("--revision", default="main", help="Git branch or revision tag (default: 'main')")
+    hf_parser.add_argument("--json", action="store_true", help="Print output in JSON format")
+    hf_parser.add_argument("--sarif", help="Path to export SARIF v2.1.0 JSON report")
+    hf_parser.add_argument("--blocklist", help="Path to custom blocklist rules file")
+    hf_parser.add_argument("--allowlist", help="Path to custom allowlist rules file")
+    hf_parser.add_argument("--ignore-file", help="Path to custom ignore rules file")
+    hf_parser.add_argument("--export-report", help="Export scan report to a file (.md or .html)")
+    hf_parser.add_argument("--threads", type=int, default=4, help="Number of concurrent worker threads")
+
+    # init-hook command
+    hook_parser = subparsers.add_parser("init-hook", help="Install a Git pre-commit hook into .git/hooks/pre-commit")
+    hook_parser.add_argument("--force", action="store_true", help="Overwrite existing pre-commit hook file if present")
     
     args = parser.parse_args()
+    
+    # Handle init-hook standalone command
+    if args.command == "init-hook":
+        success = init_pre_commit_hook(force=args.force)
+        sys.exit(0 if success else 1)
     
     # Load config file
     config = load_config_file(getattr(args, "config", None))
     
     blocklist_path = getattr(args, "blocklist", None) or config.get("blocklist")
     allowlist_path = getattr(args, "allowlist", None) or config.get("allowlist")
+    ignore_path = getattr(args, "ignore_file", None) or config.get("ignore_file")
     
     custom_blocklist = load_custom_rules_file(blocklist_path)
     custom_allowlist = load_custom_rules_file(allowlist_path)
@@ -367,17 +507,17 @@ def main():
         if len(files) > 1 and threads > 1:
             with ThreadPoolExecutor(max_workers=threads) as executor:
                 future_to_file = {
-                    executor.submit(scan_file, f, custom_blocklist, custom_allowlist): f 
+                    executor.submit(scan_file, f, custom_blocklist, custom_allowlist, ignore_file=ignore_path): f 
                     for f in files
                 }
                 for future in as_completed(future_to_file):
                     results.append(future.result())
         else:
             for filepath in files:
-                results.append(scan_file(filepath, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist))
+                results.append(scan_file(filepath, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist, ignore_file=ignore_path))
             
     elif args.command == "scan-url":
-        res = handle_url_scan(args.url, is_json=args.json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist)
+        res = handle_url_scan(args.url, is_json=args.json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist, ignore_file=ignore_path)
         results.append(res)
         
     elif args.command == "scan-urls":
@@ -390,11 +530,23 @@ def main():
         threads = getattr(args, "threads", 4)
         with ThreadPoolExecutor(max_workers=threads) as executor:
             future_to_url = {
-                executor.submit(handle_url_scan, u, is_json=args.json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist): u
+                executor.submit(handle_url_scan, u, is_json=args.json, custom_blocklist=custom_blocklist, custom_allowlist=custom_allowlist, ignore_file=ignore_path): u
                 for u in urls
             }
             for future in as_completed(future_to_url):
                 results.append(future.result())
+                
+    elif args.command == "scan-hf":
+        threads = getattr(args, "threads", 4)
+        results = handle_hf_scan(
+            args.repo_id,
+            revision=args.revision,
+            is_json=args.json,
+            custom_blocklist=custom_blocklist,
+            custom_allowlist=custom_allowlist,
+            ignore_file=ignore_path,
+            threads=threads
+        )
         
     # Presentation
     if args.json:

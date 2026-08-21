@@ -88,10 +88,27 @@ modelsentry scan SAMPLES/ --recursive --export-report audit.html
 modelsentry scan SAMPLES/ --recursive --export-report audit.md
 ```
 
-### Custom Blocklist & Allowlist Rules
-Supply custom rules via text or JSON files:
+### Custom Blocklist, Allowlist & Ignore Suppression (`.modelsentryignore`)
+Supply custom rules via text/JSON files, or suppress expected findings using `.modelsentryignore`:
 ```bash
+# Custom blocklist/allowlist
 modelsentry scan SAMPLES/ --blocklist custom_blocklist.txt --allowlist custom_allowlist.txt
+
+# Suppress false positives or expected references via ignore file
+modelsentry scan SAMPLES/ --ignore-file .modelsentryignore
+```
+
+### Scanning Remote Hugging Face Repositories (`scan-hf`)
+Inspect all model weight artifacts inside a remote Hugging Face model repository before downloading:
+```bash
+modelsentry scan-hf gpt2
+modelsentry scan-hf meta-llama/Llama-2-7b --revision main --export-report hf_audit.html
+```
+
+### Installing Git Pre-Commit Hook (`init-hook`)
+Prevent committing malicious or unsafe model artifacts into your repository:
+```bash
+modelsentry init-hook
 ```
 
 ### Scanning Remote URLs & Batch URL Lists
@@ -116,7 +133,8 @@ You can create a `.modelsentryrc` or `modelsentry.json` file in your project roo
   "max_size_mb": 500,
   "min_severity": "MEDIUM",
   "blocklist": "custom_blocklist.txt",
-  "allowlist": "custom_allowlist.txt"
+  "allowlist": "custom_allowlist.txt",
+  "ignore_file": ".modelsentryignore"
 }
 ```
 
